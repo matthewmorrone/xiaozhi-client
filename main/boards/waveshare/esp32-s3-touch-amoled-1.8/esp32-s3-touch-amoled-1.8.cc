@@ -23,6 +23,8 @@
 #include <esp_lvgl_port.h>
 #include <lvgl.h>
 
+#include <cstring>
+
 #define TAG "WaveshareEsp32s3TouchAMOLED1inch8"
 
 class Pmic : public Axp2101 {
@@ -69,8 +71,81 @@ static const sh8601_lcd_init_cmd_t vendor_specific_init[] = {
     {0x29, (uint8_t[]){0x00}, 0, 10}
 };
 
-// 在waveshare_amoled_1_8类之前添加新的显示类
 class CustomLcdDisplay : public SpiLcdDisplay {
+private:
+    static bool EmotionIs(const char* emotion, const char* name) {
+        return emotion != nullptr && std::strcmp(emotion, name) == 0;
+    }
+
+    static lv_color_t GetEmotionColor(const char* emotion) {
+        if (EmotionIs(emotion, "happy") || EmotionIs(emotion, "laughing")) {
+            return lv_color_hex(0x20C997);
+        }
+        if (EmotionIs(emotion, "sad") || EmotionIs(emotion, "sleepy")) {
+            return lv_color_hex(0x5C7CFA);
+        }
+        if (EmotionIs(emotion, "angry")) {
+            return lv_color_hex(0xFF4D4F);
+        }
+        if (EmotionIs(emotion, "thinking")) {
+            return lv_color_hex(0x845EF7);
+        }
+        if (EmotionIs(emotion, "surprised")) {
+            return lv_color_hex(0xFAB005);
+        }
+        if (EmotionIs(emotion, "listening")) {
+            return lv_color_hex(0x12B886);
+        }
+        if (EmotionIs(emotion, "speaking")) {
+            return lv_color_hex(0xFD7E14);
+        }
+        return lv_color_hex(0x2F80ED);
+    }
+
+    static void OnScreenLongPressed(lv_event_t*) {
+        auto& app = Application::GetInstance();
+        app.Schedule([]() {
+            auto& app = Application::GetInstance();
+            if (app.GetDeviceState() != kDeviceStateStarting) {
+                app.ToggleChatState();
+            }
+        });
+    }
+
+    static void AddLongPressHandler(lv_obj_t* obj) {
+        if (obj == nullptr) {
+            return;
+        }
+        lv_obj_add_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(obj, OnScreenLongPressed, LV_EVENT_LONG_PRESSED, nullptr);
+    }
+
+    void ApplySolidEmotionStyle(lv_color_t color) {
+        if (gif_controller_ != nullptr) {
+            gif_controller_->Stop();
+            gif_controller_.reset();
+        }
+
+        if (emoji_image_ != nullptr) {
+            lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (emoji_label_ != nullptr) {
+            lv_label_set_text(emoji_label_, "");
+            lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (emoji_box_ == nullptr) {
+            return;
+        }
+
+        lv_obj_remove_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_size(emoji_box_, (LV_HOR_RES * 3) / 5, (LV_HOR_RES * 3) / 5);
+        lv_obj_set_style_bg_color(emoji_box_, color, 0);
+        lv_obj_set_style_bg_opa(emoji_box_, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(emoji_box_, 0, 0);
+        lv_obj_set_style_radius(emoji_box_, LV_RADIUS_CIRCLE, 0);
+        lv_obj_center(emoji_box_);
+    }
+
 public:
     CustomLcdDisplay(esp_lcd_panel_io_handle_t io_handle,
                     esp_lcd_panel_handle_t panel_handle,
@@ -88,12 +163,22 @@ public:
     }
 
     virtual void SetupUI() override {
-        // Call parent SetupUI() first to create all lvgl objects
         SpiLcdDisplay::SetupUI();
 
         DisplayLockGuard lock(this);
         lv_obj_set_style_pad_left(status_bar_, LV_HOR_RES * 0.1, 0);
         lv_obj_set_style_pad_right(status_bar_, LV_HOR_RES * 0.1, 0);
+        AddLongPressHandler(container_);
+        AddLongPressHandler(emoji_box_);
+        AddLongPressHandler(top_bar_);
+        AddLongPressHandler(status_bar_);
+        AddLongPressHandler(bottom_bar_);
+        ApplySolidEmotionStyle(GetEmotionColor("neutral"));
+    }
+
+    virtual void SetEmotion(const char* emotion) override {
+        DisplayLockGuard lock(this);
+        ApplySolidEmotionStyle(GetEmotionColor(emotion));
     }
 };
 
