@@ -15,6 +15,8 @@
 #include "oled_display.h"
 #include "board.h"
 #include "settings.h"
+#include "language.h"
+#include "tailscale.h"
 #include "lvgl_theme.h"
 #include "lvgl_display.h"
 
@@ -298,6 +300,83 @@ void McpServer::AddUserOnlyTools() {
                 return true;
             });
     }
+
+    // Language selection (BCP-47 code, e.g. "en-US"). Takes effect on the next
+    // server hello; UI strings remain whatever the firmware was built with.
+    AddUserOnlyTool("self.language.get",
+        "Get the current language code and the list of supported codes.",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            cJSON* json = cJSON_CreateObject();
+            cJSON_AddStringToObject(json, "current", Language::GetCode().c_str());
+            cJSON* supported = cJSON_CreateArray();
+            for (const auto& code : Language::ListSupported()) {
+                cJSON_AddItemToArray(supported, cJSON_CreateString(code.c_str()));
+            }
+            cJSON_AddItemToObject(json, "supported", supported);
+            return json;
+        });
+
+    AddUserOnlyTool("self.language.set",
+        "Set the language the assistant should respond in. Pass a BCP-47 code "
+        "from `self.language.get`.supported (e.g. \"en-US\", \"zh-CN\", \"ja-JP\"). "
+        "The next time the device reconnects to the server it will request "
+        "responses in this language.",
+        PropertyList({
+            Property("code", kPropertyTypeString)
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto code = properties["code"].value<std::string>();
+            if (!Language::SetCode(code)) {
+                throw std::runtime_error("Unsupported language code: " + code);
+            }
+            return true;
+        });
+
+    // Tailscale credentials so the device can reach the server over a tailnet
+    // when off-LAN. The auth key is write-only via this tool; reads do not
+    // expose it. Connection is attempted on the next activation/boot.
+    AddUserOnlyTool("self.tailscale.get",
+        "Get Tailscale configuration (without the auth key).",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto creds = Tailscale::Load();
+            cJSON* json = cJSON_CreateObject();
+            cJSON_AddBoolToObject(json, "enabled", creds.enabled);
+            cJSON_AddBoolToObject(json, "auth_key_configured", !creds.auth_key.empty());
+            cJSON_AddStringToObject(json, "hostname", creds.hostname.c_str());
+            cJSON_AddStringToObject(json, "login_server", creds.login_server.c_str());
+            return json;
+        });
+
+    AddUserOnlyTool("self.tailscale.set",
+        "Configure Tailscale credentials for off-network access. Provide the "
+        "tskey-auth-... key, an optional hostname, and an optional login_server "
+        "(for Headscale or other control planes). Pass enabled=false to keep "
+        "credentials but skip the connect attempt.",
+        PropertyList({
+            Property("auth_key", kPropertyTypeString),
+            Property("hostname", kPropertyTypeString, ""),
+            Property("login_server", kPropertyTypeString, ""),
+            Property("enabled", kPropertyTypeBoolean, true)
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            Tailscale::Credentials creds;
+            creds.auth_key = properties["auth_key"].value<std::string>();
+            creds.hostname = properties["hostname"].value<std::string>();
+            creds.login_server = properties["login_server"].value<std::string>();
+            creds.enabled = properties["enabled"].value<bool>();
+            Tailscale::Save(creds);
+            return true;
+        });
+
+    AddUserOnlyTool("self.tailscale.clear",
+        "Forget all Tailscale credentials.",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            Tailscale::Clear();
+            return true;
+        });
 }
 
 void McpServer::AddTool(McpTool* tool) {

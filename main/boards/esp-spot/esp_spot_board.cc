@@ -58,8 +58,10 @@ esp_err_t Initialize(i2c_bus_handle_t i2c_bus, uint8_t addr = BMI270_I2C_ADDRESS
     return ESP_OK;
 }
 
-// Only used for deep sleep wakeup with wrist gesture interrupt
-esp_err_t EnableImuIntForWakeup() {
+// Configures BMI270 to raise INT1 on a wrist-raise gesture.
+// Used for both active-mode wake (GPIO ISR -> chat toggle) and deep-sleep
+// wakeup (ext1 ANY_HIGH on the same line). Idempotent.
+esp_err_t ConfigureWristGestureInt() {
     if (!bmi_handle_) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -107,6 +109,9 @@ esp_err_t EnableImuIntForWakeup() {
     return ESP_OK;
 }
 
+// Backwards-compatible alias retained for the deep-sleep call site.
+inline esp_err_t EnableImuIntForWakeup() { return ConfigureWristGestureInt(); }
+
 }  // namespace Bmi270Imu
 
 #endif  // IMU_INT_GPIO
@@ -126,6 +131,8 @@ private:
     i2c_bus_handle_t shared_i2c_bus_handle_ = nullptr;
     static constexpr int kDeepSleepTimeoutSeconds = 10 * 60; // 10 minutes
     bool imu_ready_ = false;
+    TaskHandle_t imu_event_task_ = nullptr;
+    int64_t last_wrist_gesture_us_ = 0;
 #endif
 
 #ifdef IMU_INT_GPIO
@@ -288,12 +295,15 @@ private:
         gpio_config(&io_conf_2);
 
 #ifdef IMU_INT_GPIO
+        // BMI270 INT1 is configured push-pull active-high (see
+        // ConfigureWristGestureInt), so trigger the active-mode ISR on the
+        // rising edge. Deep-sleep wake uses ext1 ANY_HIGH on the same line.
         gpio_config_t io_conf_imu_int = {
             .pin_bit_mask = (1ULL << IMU_INT_GPIO),
             .mode = GPIO_MODE_INPUT,
             .pull_up_en = GPIO_PULLUP_DISABLE,
             .pull_down_en = GPIO_PULLDOWN_ENABLE,
-            .intr_type = GPIO_INTR_NEGEDGE,
+            .intr_type = GPIO_INTR_POSEDGE,
         };
         gpio_config(&io_conf_imu_int);
         gpio_install_isr_service(0);
@@ -307,6 +317,53 @@ private:
     }
 
 #ifdef IMU_INT_GPIO
+    static void IRAM_ATTR ImuIsrHandler(void* arg) {
+        auto* self = static_cast<EspSpot*>(arg);
+        BaseType_t hp_woken = pdFALSE;
+        if (self->imu_event_task_ != nullptr) {
+            vTaskNotifyGiveFromISR(self->imu_event_task_, &hp_woken);
+        }
+        if (hp_woken == pdTRUE) {
+            portYIELD_FROM_ISR();
+        }
+    }
+
+    void StartWristGestureWake() {
+        if (!imu_ready_) {
+            return;
+        }
+        if (Bmi270Imu::ConfigureWristGestureInt() != ESP_OK) {
+            ESP_LOGW(TAG, "Wrist gesture configuration failed; active-mode wake disabled");
+            return;
+        }
+
+        xTaskCreate(
+            [](void* arg) {
+                auto* self = static_cast<EspSpot*>(arg);
+                for (;;) {
+                    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+                    int64_t now = esp_timer_get_time();
+                    // 750 ms debounce: BMI270 may briefly raise INT1 multiple
+                    // times during a single arm motion.
+                    if (now - self->last_wrist_gesture_us_ < 750000) {
+                        continue;
+                    }
+                    self->last_wrist_gesture_us_ = now;
+                    ESP_LOGI(TAG, "Wrist gesture detected, toggling chat state");
+                    self->HandleUserActivity();
+                    Application::GetInstance().ToggleChatState();
+                }
+            },
+            "imu_wake", 4096, this, 5, &imu_event_task_);
+
+        esp_err_t err = gpio_isr_handler_add(IMU_INT_GPIO, &EspSpot::ImuIsrHandler, this);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to install IMU ISR: %s", esp_err_to_name(err));
+            return;
+        }
+        ESP_LOGI(TAG, "Wrist-raise wake enabled on GPIO %d", IMU_INT_GPIO);
+    }
+
     void InitializePowerSaveTimer() {
         if (!imu_ready_) {
             ESP_LOGW(TAG, "IMU not ready, skip deep sleep timer");
@@ -376,6 +433,7 @@ public:
         InitializeI2c();
         InitializeButtons();
 #ifdef IMU_INT_GPIO
+        StartWristGestureWake();
         InitializePowerSaveTimer();
 #endif  // IMU_INT_GPIO
     }

@@ -1,6 +1,7 @@
 #include "board.h"
 #include "system_info.h"
 #include "settings.h"
+#include "language.h"
 #include "display/display.h"
 #include "display/oled_display.h"
 #include "assets/lang_config.h"
@@ -107,7 +108,7 @@ std::string Board::GetSystemInfoJson() {
             }
         }
     */
-    std::string json = R"({"version":2,"language":")" + std::string(Lang::CODE) + R"(",)";
+    std::string json = R"({"version":2,"language":")" + Language::GetCode() + R"(",)";
     json += R"("flash_size":)" + std::to_string(SystemInfo::GetFlashSize()) + R"(,)";
     json += R"("minimum_free_heap_size":")" + std::to_string(SystemInfo::GetMinimumFreeHeapSize()) + R"(",)";
     json += R"("mac_address":")" + SystemInfo::GetMacAddress() + R"(",)";

@@ -1,6 +1,7 @@
 #include "ota.h"
 #include "system_info.h"
 #include "settings.h"
+#include "language.h"
 #include "assets/lang_config.h"
 
 #include <freertos/FreeRTOS.h>
@@ -65,7 +66,7 @@ std::unique_ptr<Http> Ota::SetupHttp() {
         ESP_LOGI(TAG, "Setup HTTP, User-Agent: %s, Serial-Number: %s", user_agent.c_str(), serial_number_.c_str());
     }
     http->SetHeader("User-Agent", user_agent);
-    http->SetHeader("Accept-Language", Lang::CODE);
+    http->SetHeader("Accept-Language", Language::GetCode().c_str());
     http->SetHeader("Content-Type", "application/json");
 
     return http;
