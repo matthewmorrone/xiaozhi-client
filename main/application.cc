@@ -9,6 +9,7 @@
 #include "mcp_server.h"
 #include "assets.h"
 #include "settings.h"
+#include "tailscale.h"
 
 #include <cstring>
 #include <esp_log.h>
@@ -321,6 +322,10 @@ void Application::HandleActivationDoneEvent() {
 }
 
 void Application::ActivationTask() {
+    // Bring up Tailscale (no-op when disabled or component absent) so OTA and
+    // protocol traffic can ride the tailnet when off-LAN.
+    Tailscale::Connect();
+
     // Create OTA object for activation process
     ota_ = std::make_unique<Ota>();
 
