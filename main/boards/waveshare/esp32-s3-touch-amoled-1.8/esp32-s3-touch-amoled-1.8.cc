@@ -766,7 +766,12 @@ private:
         Settings s("ui", false);
         bool show_bottom = s.GetBool("show_bottom", true);
         bool show_top    = s.GetBool("show_top", true);
-        bool wifi_on     = s.GetBool("wifi_on", true);
+        // Derive wifi_on from runtime state, not the persisted preference:
+        // WifiBoard auto-starts the station on boot regardless of our stored
+        // bool, so trusting the stored value drifts after a reboot. Treat
+        // "not in config-AP mode" as "station is on" — the only time the
+        // station is provably off is when we've fallen back to config mode.
+        bool wifi_on     = !WifiManager::GetInstance().IsConfigMode();
         int rotation     = s.GetInt("rotation", 0);
         auto* codec = Board::GetInstance().GetAudioCodec();
         int volume = codec ? codec->output_volume() : 70;
@@ -1157,17 +1162,24 @@ private:
                 return true;
             });
         mcp_server.AddTool("self.firmware.get_ota_endpoints",
-            "Return both stored OTA URLs (home and away) plus which one is "
-            "currently active.",
+            "Return both stored OTA URLs (home and away), the URL currently "
+            "in wifi/ota_url (the one OTA actually uses), and which mode it "
+            "matches (home / away / other if it has been set out-of-band).",
             PropertyList(),
             [](const PropertyList& p) -> ReturnValue {
                 Settings ui("ui", false);
                 std::string home = ui.GetString("ota_home", "");
                 std::string away = ui.GetString("ota_away", "");
-                bool is_away = ui.GetBool("hotspot_away", false);
+                std::string current = Settings("wifi", false).GetString("ota_url", "");
+                const char* active = "other";
+                if (!current.empty()) {
+                    if (current == away)      active = "away";
+                    else if (current == home) active = "home";
+                }
                 return std::string("{\"home\":\"") + home +
                        "\",\"away\":\"" + away +
-                       "\",\"active\":\"" + (is_away ? "away" : "home") + "\"}";
+                       "\",\"current\":\"" + current +
+                       "\",\"active\":\"" + active + "\"}";
             });
     }
 
