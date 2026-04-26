@@ -844,14 +844,20 @@ private:
         // self.firmware.set_ota_home / set_ota_away.
         // Icon: the wifi glyph rotated 180° = signal radiating downward,
         // the canonical "personal hotspot / tethering" pictogram.
+        // Switch state is derived from the LIVE wifi/ota_url, not the stored
+        // hotspot_away flag, so an out-of-band change to ota_url (e.g. via
+        // self.firmware.set_ota_url) doesn't leave the UI lying.
         {
             lv_obj_t* row = MakeRowShell(settings_root_);
             lv_obj_t* icon = MakeFaIcon(row, kIconWifiOn());
             lv_obj_set_style_transform_pivot_x(icon, LV_PCT(50), 0);
             lv_obj_set_style_transform_pivot_y(icon, LV_PCT(50), 0);
             lv_obj_set_style_transform_rotation(icon, 1800, 0);  // 180.0°
+            std::string current = Settings("wifi", false).GetString("ota_url", "");
+            std::string away_url = s.GetString("ota_away", "");
+            bool initially_away = !away_url.empty() && current == away_url;
             lv_obj_t* sw = lv_switch_create(row);
-            if (s.GetBool("hotspot_away", false)) lv_obj_add_state(sw, LV_STATE_CHECKED);
+            if (initially_away) lv_obj_add_state(sw, LV_STATE_CHECKED);
             lv_obj_add_event_cb(sw, SettingsHotspotToggleCb, LV_EVENT_VALUE_CHANGED, this);
         }
         (void)rotation;
@@ -999,27 +1005,30 @@ private:
     // The bottom physical button is the AXP2101 PWRON key — it doesn't have
     // its own GPIO. We poll the PMIC's IRQ status register every 50 ms and
     // dispatch short-press → settings menu.
-    esp_timer_handle_t pmic_poll_timer_ = nullptr;
+    // PollPowerKey() does blocking I2C reads, so we cannot run it on the
+    // shared esp_timer worker — a stalled bus would delay every other
+    // periodic timer in the system (backlight, power-save, wifi). Use a
+    // dedicated FreeRTOS task that sleeps 50 ms between polls instead.
+    TaskHandle_t pmic_poll_task_ = nullptr;
     void StartPmicKeyPolling() {
-        const esp_timer_create_args_t args = {
-            .callback = [](void* arg) {
+        xTaskCreate(
+            [](void* arg) {
                 auto* self = static_cast<WaveshareEsp32s3TouchAMOLED1inch8*>(arg);
-                if (!self->pmic_) return;
-                int ev = self->pmic_->PollPowerKey();
-                if (ev == 1 && self->display_ != nullptr) {
-                    // Schedule on app thread so LVGL ops happen with the lock.
-                    Application::GetInstance().Schedule([self]() {
-                        if (self->display_) self->display_->ToggleSettings();
-                    });
+                const TickType_t period = pdMS_TO_TICKS(50);
+                while (true) {
+                    if (self->pmic_) {
+                        int ev = self->pmic_->PollPowerKey();
+                        if (ev == 1 && self->display_ != nullptr) {
+                            // LVGL ops must run with the app/display lock; defer.
+                            Application::GetInstance().Schedule([self]() {
+                                if (self->display_) self->display_->ToggleSettings();
+                            });
+                        }
+                    }
+                    vTaskDelay(period);
                 }
             },
-            .arg = this,
-            .dispatch_method = ESP_TIMER_TASK,
-            .name = "pmic_key_poll",
-            .skip_unhandled_events = true,
-        };
-        ESP_ERROR_CHECK(esp_timer_create(&args, &pmic_poll_timer_));
-        ESP_ERROR_CHECK(esp_timer_start_periodic(pmic_poll_timer_, 50 * 1000));
+            "pmic_key_poll", 4096, this, 5, &pmic_poll_task_);
     }
 
     esp_lcd_panel_handle_t panel_handle_ = nullptr;
