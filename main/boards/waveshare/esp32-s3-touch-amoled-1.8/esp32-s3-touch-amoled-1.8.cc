@@ -3,6 +3,8 @@
 #include "display/lvgl_display/lvgl_theme.h"
 #include "display/lvgl_display/lvgl_font.h"
 #include "esp_lcd_sh8601.h"
+#include "wifi_manager.h"
+#include <functional>
 
 LV_FONT_DECLARE(icons_bs_ms_36);
 LV_FONT_DECLARE(clock_mono_30);
@@ -33,6 +35,7 @@ LV_FONT_DECLARE(clock_mono_30);
 #define TAG "WaveshareEsp32s3TouchAMOLED1inch8"
 #define DEBUG_RULER 1
 
+
 class Pmic : public Axp2101 {
 public:
     Pmic(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : Axp2101(i2c_bus, addr) {
@@ -55,10 +58,29 @@ public:
         WriteReg(0x90, 0x01);
     
         WriteReg(0x64, 0x02); // CV charger voltage setting to 4.1V
-        
+
         WriteReg(0x61, 0x02); // set Main battery precharge current to 50mA
         WriteReg(0x62, 0x08); // set Main battery charger current to 400mA ( 0x08-200mA, 0x09-300mA, 0x0A-400mA )
         WriteReg(0x63, 0x01); // set Main battery term charge current to 25mA
+
+        // Enable PWRON-key IRQs (short + long). The bottom power button on
+        // this board is wired through the PMIC, not a GPIO — we read it
+        // by polling INTSTS2.
+        // INTEN2 (0x41) bit 2 = PKEY_LONG, bit 3 = PKEY_SHORT.
+        WriteReg(0x41, 0x0C);
+        // Clear any stale events.
+        WriteReg(0x49, 0xFF);
+    }
+
+    // Poll PWRON-key event. Returns 1 = short press, 2 = long press, 0 = none.
+    int PollPowerKey() {
+        uint8_t status = ReadReg(0x49);
+        int event = 0;
+        if (status & 0x08)      event = 1;  // PKEY_SHORT
+        else if (status & 0x04) event = 2;  // PKEY_LONG
+        // W1C: writing back the bits that were set clears them.
+        if (status & 0x0C) WriteReg(0x49, status & 0x0C);
+        return event;
     }
 };
 
@@ -93,6 +115,11 @@ private:
     // transition is treated as a discard rather than "awaiting response."
     static bool cancel_pending_;
 
+    // Settings menu (opened by a single click of the boot button).
+    lv_obj_t* settings_root_ = nullptr;
+    bool ui_show_top_ = true;     // wifi / clock / battery at top
+    bool ui_show_bottom_ = true;  // centered chat / boot info text
+
     static bool LooksLikeClock(const char* s) {
         return s != nullptr && std::strlen(s) == 5 && s[2] == ':';
     }
@@ -124,9 +151,11 @@ private:
     // Speaking interrupts the assistant. Sliding finger off the screen while
     // holding cancels the recording without sending it to the server.
     static void OnScreenLongPressed(lv_event_t*) {
-        // Only Idle → start listening. Speaking is handled exclusively by
-        // OnScreenPressed (abort) — we never want a hold-during-speaking to
-        // turn into a new listening session.
+        // Only Idle → start listening. Skip if Wi-Fi is down — otherwise
+        // OpenAudioChannel would block on TCP timeout for ~30 s while the
+        // user thinks they're recording. Better to refuse fast.
+        auto& wifi = WifiManager::GetInstance();
+        if (!wifi.IsConnected() || wifi.IsConfigMode()) return;
         auto& app = Application::GetInstance();
         app.Schedule([]() {
             auto& app = Application::GetInstance();
@@ -298,6 +327,9 @@ public:
 
         ApplyStateColor(Application::GetInstance().GetDeviceState());
 
+        // Apply persisted UI settings (volume, brightness, rotation, hide-bars).
+        LoadAndApplyPersistedSettings();
+
 #ifdef DEBUG_RULER
         DrawDebugRuler();
 #endif
@@ -429,6 +461,415 @@ public:
         ApplyStateColor(Application::GetInstance().GetDeviceState());
         SpiLcdDisplay::SetStatus(status);
     }
+
+    // ---- Persisted UI settings ----
+    void LoadAndApplyPersistedSettings() {
+        Settings s("ui", false);
+        ui_show_top_ = s.GetBool("show_top", true);
+        ui_show_bottom_ = s.GetBool("show_bottom", true);
+        ApplyTopVisible(ui_show_top_);
+        ApplyBottomVisible(ui_show_bottom_);
+
+        int volume = s.GetInt("volume", -1);
+        if (volume >= 0) {
+            auto* codec = Board::GetInstance().GetAudioCodec();
+            if (codec) codec->SetOutputVolume(volume);
+        }
+        int brightness = s.GetInt("brightness", -1);
+        if (brightness >= 5 && brightness <= 100) {
+            auto* bl = Board::GetInstance().GetBacklight();
+            if (bl) bl->SetBrightness((uint8_t)brightness, true);
+        }
+        // Rotation is applied by the board's ApplyRotation() once panel and
+        // touch are both initialized — see WaveshareEsp32s3TouchAMOLED1inch8
+        // constructor.
+    }
+
+    // Top row = wifi / clock / battery (top_bar_ + the standalone clock_label_).
+    void ApplyTopVisible(bool show) {
+        auto setv = [show](lv_obj_t* o) {
+            if (o == nullptr) return;
+            if (show) lv_obj_remove_flag(o, LV_OBJ_FLAG_HIDDEN);
+            else      lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+        };
+        setv(top_bar_);
+        setv(clock_label_);
+    }
+
+    // The "bottom text" the user sees is status_label_ (state names like
+    // "Listening...") in status_bar_, which is at LV_ALIGN_BOTTOM_MID. The
+    // centered chat_message_label_ in bottom_bar_ is unaffected.
+    void ApplyBottomVisible(bool show) {
+        if (status_bar_ == nullptr) return;
+        if (show) lv_obj_remove_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);
+        else      lv_obj_add_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    // ---- Settings menu ----
+    bool IsSettingsOpen() const { return settings_root_ != nullptr; }
+
+    void SetLvRotation(int rot) {
+        DisplayLockGuard lock(this);
+        lv_display_set_rotation(display_, (lv_display_rotation_t)(rot & 0x3));
+    }
+
+    void ToggleSettings() {
+        if (IsSettingsOpen()) HideSettings();
+        else                  ShowSettings();
+    }
+
+    void HideSettings() {
+        DisplayLockGuard lock(this);
+        if (settings_root_ != nullptr) {
+            lv_obj_del(settings_root_);
+            settings_root_ = nullptr;
+        }
+    }
+
+    void ShowSettings() {
+        DisplayLockGuard lock(this);
+        if (settings_root_ != nullptr) return;
+        BuildSettingsMenu();
+    }
+
+private:
+    static void SettingsCloseCb(lv_event_t* e) {
+        auto* self = static_cast<CustomLcdDisplay*>(lv_event_get_user_data(e));
+        if (self) self->HideSettings();
+    }
+
+    static void SettingsBottomToggleCb(lv_event_t* e) {
+        auto* self = static_cast<CustomLcdDisplay*>(lv_event_get_user_data(e));
+        if (!self) return;
+        bool on = lv_obj_has_state(lv_event_get_target_obj(e), LV_STATE_CHECKED);
+        self->ui_show_bottom_ = on;
+        Settings("ui", true).SetBool("show_bottom", on);
+        self->ApplyBottomVisible(on);
+    }
+
+    static void SettingsTopToggleCb(lv_event_t* e) {
+        auto* self = static_cast<CustomLcdDisplay*>(lv_event_get_user_data(e));
+        if (!self) return;
+        bool on = lv_obj_has_state(lv_event_get_target_obj(e), LV_STATE_CHECKED);
+        self->ui_show_top_ = on;
+        Settings("ui", true).SetBool("show_top", on);
+        self->ApplyTopVisible(on);
+    }
+
+    static void SettingsVolumeCb(lv_event_t* e) {
+        lv_obj_t* slider = lv_event_get_target_obj(e);
+        int v = lv_slider_get_value(slider);
+        auto* codec = Board::GetInstance().GetAudioCodec();
+        if (codec) codec->SetOutputVolume(v);
+        Settings("ui", true).SetInt("volume", v);
+        // Reactive icon: muted glyph at 0, speaker glyph otherwise.
+        lv_obj_t* row = lv_obj_get_parent(slider);
+        if (row && lv_obj_get_child_count(row) >= 2) {
+            lv_obj_t* icon = lv_obj_get_child(row, 0);
+            lv_label_set_text(icon, v == 0 ? kIconVolOff() : kIconVolUp());
+        }
+    }
+
+    static void SettingsBrightnessCb(lv_event_t* e) {
+        int v = lv_slider_get_value(lv_event_get_target_obj(e));
+        auto* bl = Board::GetInstance().GetBacklight();
+        if (bl) bl->SetBrightness((uint8_t)v, true);
+        Settings("ui", true).SetInt("brightness", v);
+    }
+
+    static void SettingsWifiToggleCb(lv_event_t* e) {
+        lv_obj_t* sw = lv_event_get_target_obj(e);
+        bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
+        auto& wifi = WifiManager::GetInstance();
+        if (on) wifi.StartStation();
+        else    wifi.StopStation();
+        Settings("ui", true).SetBool("wifi_on", on);
+        // Reactive icon: wifi when on, wifi_off when off.
+        lv_obj_t* row = lv_obj_get_parent(sw);
+        if (row && lv_obj_get_child_count(row) >= 2) {
+            lv_obj_t* icon = lv_obj_get_child(row, 0);
+            lv_label_set_text(icon, on ? kIconWifiOn() : kIconWifiOff());
+        }
+    }
+
+    // Hotspot (away) toggle: swap the OTA URL the device pings on boot
+    // between two pre-configured endpoints. The OTA response carries the
+    // websocket URL the device then connects to, so this single switch
+    // reroutes everything downstream.
+    //   home  → LAN-IP   (e.g. http://192.168.1.50:8003/xiaozhi/ota/)
+    //   away  → Tailscale (e.g. http://100.x.y.z:8003/xiaozhi/ota/)
+    // Both URLs are stored in the "ui" NVS namespace under keys
+    // ota_home / ota_away. Populate them once via the MCP tools
+    // self.firmware.set_ota_home and self.firmware.set_ota_away.
+    // Toggle takes effect on next reboot — we trigger Application::Reboot()
+    // so the change is immediate and unambiguous.
+    static void SettingsHotspotToggleCb(lv_event_t* e) {
+        lv_obj_t* sw = lv_event_get_target_obj(e);
+        bool away = lv_obj_has_state(sw, LV_STATE_CHECKED);
+        Settings ui("ui", false);
+        // If the user hasn't ALSO configured the home URL, falling back from
+        // away → home would brick the device. Require both before allowing
+        // the switch to do anything.
+        std::string home_url = ui.GetString("ota_home", "");
+        std::string away_url = ui.GetString("ota_away", "");
+        std::string target = away ? away_url : home_url;
+        if (target.empty() || home_url.empty() || away_url.empty()) {
+            ESP_LOGW("Settings",
+                     "Hotspot toggle ignored: ota_home=%s ota_away=%s",
+                     home_url.empty() ? "(empty)" : "set",
+                     away_url.empty() ? "(empty)" : "set");
+            // Bounce the switch back to its prior state.
+            if (away) lv_obj_clear_state(sw, LV_STATE_CHECKED);
+            else      lv_obj_add_state(sw, LV_STATE_CHECKED);
+            // Surface the failure so the user knows why nothing happened.
+            Application::GetInstance().Alert(
+                "Setup",
+                "Set OTA URLs first via MCP:\n"
+                "self.firmware.set_ota_home\n"
+                "self.firmware.set_ota_away",
+                "warning");
+            return;
+        }
+        Settings("wifi", true).SetString("ota_url", target);
+        Settings("ui", true).SetBool("hotspot_away", away);
+        ESP_LOGI("Settings", "OTA URL → %s mode: %s",
+                 away ? "away" : "home", target.c_str());
+        // Reboot in 500 ms so the user sees the switch animation finish.
+        esp_timer_handle_t t = nullptr;
+        const esp_timer_create_args_t args = {
+            .callback = [](void*) { Application::GetInstance().Reboot(); },
+            .arg = nullptr, .dispatch_method = ESP_TIMER_TASK,
+            .name = "hotspot_reboot", .skip_unhandled_events = true,
+        };
+        if (esp_timer_create(&args, &t) == ESP_OK) {
+            esp_timer_start_once(t, 500 * 1000);
+        }
+    }
+
+    // Cycle 0° → 90° → 180° → 270° → 0°. Touch driver mirror/swap flags are
+    // updated alongside via the board's ApplyRotation, so taps land where
+    // the user pressed.
+    static void SettingsRotationCb(lv_event_t* e);
+
+    // Empty row shell with horizontal flex layout: caller adds children (icon
+    // on the left, control on the right).
+    lv_obj_t* MakeRowShell(lv_obj_t* parent) {
+        lv_obj_t* row = lv_obj_create(parent);
+        lv_obj_set_width(row, LV_PCT(100));
+        lv_obj_set_height(row, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_pad_all(row, 6, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        return row;
+    }
+
+    // 3 horizontal bars stacked vertically — top, middle, bottom. The "filled"
+    // index gets a solid white fill, the others a thin white outline. Visual
+    // language: "this row controls the [top/middle/bottom] bar of the UI."
+    lv_obj_t* MakeStackIcon(lv_obj_t* parent, int filled_bar) {
+        lv_obj_t* box = lv_obj_create(parent);
+        const int W = 22, H = 28, BH = 5, BW = 22, GAP = 3;
+        lv_obj_set_size(box, W, H);
+        lv_obj_set_style_bg_opa(box, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(box, 0, 0);
+        lv_obj_set_style_pad_all(box, 0, 0);
+        lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+        const int total = 3 * BH + 2 * GAP;
+        const int top_y = (H - total) / 2;
+        const lv_color_t white = lv_color_hex(0xFFFFFF);
+        for (int i = 0; i < 3; ++i) {
+            lv_obj_t* bar = lv_obj_create(box);
+            lv_obj_set_size(bar, BW, BH);
+            lv_obj_set_pos(bar, 0, top_y + i * (BH + GAP));
+            lv_obj_set_style_radius(bar, 1, 0);
+            lv_obj_set_style_pad_all(bar, 0, 0);
+            lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+            if (i == filled_bar) {
+                lv_obj_set_style_bg_color(bar, white, 0);
+                lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+                lv_obj_set_style_border_width(bar, 0, 0);
+            } else {
+                lv_obj_set_style_bg_opa(bar, LV_OPA_TRANSP, 0);
+                lv_obj_set_style_border_width(bar, 1, 0);
+                lv_obj_set_style_border_color(bar, white, 0);
+            }
+        }
+        return box;
+    }
+
+    // Single label rendered with the icon font. UTF-8 string is the FA-style
+    // codepoint(s) from icons_bs_ms_36.
+    lv_obj_t* MakeFaIcon(lv_obj_t* parent, const char* glyph) {
+        lv_obj_t* lbl = lv_label_create(parent);
+        lv_label_set_text(lbl, glyph);
+        lv_obj_set_style_text_font(lbl, &icons_bs_ms_36, 0);
+        lv_obj_set_style_text_color(lbl, lv_color_hex(0xFFFFFF), 0);
+        return lbl;
+    }
+
+    static const char* kIconWifiOn()    { return "\xEF\x87\xAB"; }  // U+F1EB
+    static const char* kIconWifiOff()   { return "\xEF\x9A\xAC"; }  // U+F6AC
+    static const char* kIconVolUp()     { return "\xEF\x80\xA8"; }  // U+F028
+    static const char* kIconVolOff()    { return "\xEF\x9A\xA9"; }  // U+F6A9
+    static const char* kIconSun()       { return "\xEF\x86\x85"; }  // U+F185
+
+    lv_obj_t* AddRow(lv_obj_t* parent, const char* label_text, bool icon = false) {
+        lv_obj_t* row = lv_obj_create(parent);
+        lv_obj_set_width(row, LV_PCT(100));
+        lv_obj_set_height(row, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_pad_all(row, 6, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t* lbl = lv_label_create(row);
+        lv_label_set_text(lbl, label_text);
+        lv_obj_set_style_text_color(lbl, lv_color_hex(0xFFFFFF), 0);
+        if (icon) lv_obj_set_style_text_font(lbl, &icons_bs_ms_36, 0);
+        return row;
+    }
+
+    void AddToggleRow(lv_obj_t* parent, const char* label, bool initial,
+                      lv_event_cb_t cb) {
+        lv_obj_t* row = AddRow(parent, label);
+        lv_obj_t* sw = lv_switch_create(row);
+        if (initial) lv_obj_add_state(sw, LV_STATE_CHECKED);
+        lv_obj_add_event_cb(sw, cb, LV_EVENT_VALUE_CHANGED, this);
+    }
+
+    void AddSliderRow(lv_obj_t* parent, const char* label, int initial,
+                      int min, int max, lv_event_cb_t cb, bool icon = false) {
+        lv_obj_t* row = AddRow(parent, label, icon);
+        lv_obj_t* sl = lv_slider_create(row);
+        lv_slider_set_range(sl, min, max);
+        lv_slider_set_value(sl, initial, LV_ANIM_OFF);
+        lv_obj_set_width(sl, LV_PCT(60));
+        lv_obj_add_event_cb(sl, cb, LV_EVENT_VALUE_CHANGED, this);
+    }
+
+    void AddRotationRow(lv_obj_t* parent, int initial) {
+        lv_obj_t* row = AddRow(parent, "Rotation");
+        lv_obj_t* btn = lv_button_create(row);
+        int rot = (initial == 2) ? 2 : 0;
+        lv_obj_set_user_data(btn, (void*)(intptr_t)rot);
+        lv_obj_t* l = lv_label_create(btn);
+        lv_label_set_text(l, rot == 0 ? "0°" : "180°");
+        lv_obj_set_style_pad_all(btn, 6, 0);
+        lv_obj_add_event_cb(btn, SettingsRotationCb, LV_EVENT_CLICKED, this);
+    }
+
+    void BuildSettingsMenu() {
+        Settings s("ui", false);
+        bool show_bottom = s.GetBool("show_bottom", true);
+        bool show_top    = s.GetBool("show_top", true);
+        // Derive wifi_on from runtime state, not the persisted preference:
+        // WifiBoard auto-starts the station on boot regardless of our stored
+        // bool, so trusting the stored value drifts after a reboot. Treat
+        // "not in config-AP mode" as "station is on" — the only time the
+        // station is provably off is when we've fallen back to config mode.
+        bool wifi_on     = !WifiManager::GetInstance().IsConfigMode();
+        int rotation     = s.GetInt("rotation", 0);
+        auto* codec = Board::GetInstance().GetAudioCodec();
+        int volume = codec ? codec->output_volume() : 70;
+        int brightness = s.GetInt("brightness", 75);
+
+        settings_root_ = lv_obj_create(lv_screen_active());
+        lv_obj_set_size(settings_root_, LV_HOR_RES, LV_VER_RES);
+        lv_obj_set_style_bg_color(settings_root_, lv_color_hex(0x111111), 0);
+        lv_obj_set_style_bg_opa(settings_root_, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(settings_root_, 0, 0);
+        lv_obj_set_style_radius(settings_root_, 0, 0);
+        lv_obj_set_style_pad_all(settings_root_, 14, 0);
+        lv_obj_set_style_pad_top(settings_root_, 28, 0);
+        lv_obj_set_style_pad_bottom(settings_root_, 28, 0);
+        lv_obj_set_flex_flow(settings_root_, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(settings_root_, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_scroll_dir(settings_root_, LV_DIR_VER);
+        lv_obj_align(settings_root_, LV_ALIGN_CENTER, 0, 0);
+
+        // Volume — speaker icon (reactive), then slider.
+        {
+            lv_obj_t* row = MakeRowShell(settings_root_);
+            MakeFaIcon(row, volume == 0 ? kIconVolOff() : kIconVolUp());
+            lv_obj_t* sl = lv_slider_create(row);
+            lv_slider_set_range(sl, 0, 100);
+            lv_slider_set_value(sl, volume, LV_ANIM_OFF);
+            lv_obj_set_width(sl, LV_PCT(70));
+            lv_obj_add_flag(sl, LV_OBJ_FLAG_PRESS_LOCK);
+            lv_obj_clear_flag(sl, LV_OBJ_FLAG_GESTURE_BUBBLE);
+            lv_obj_add_event_cb(sl, SettingsVolumeCb, LV_EVENT_VALUE_CHANGED, this);
+        }
+        // Brightness — sun icon, then slider.
+        {
+            lv_obj_t* row = MakeRowShell(settings_root_);
+            MakeFaIcon(row, kIconSun());
+            lv_obj_t* sl = lv_slider_create(row);
+            lv_slider_set_range(sl, 5, 100);
+            lv_slider_set_value(sl, brightness, LV_ANIM_OFF);
+            lv_obj_set_width(sl, LV_PCT(70));
+            lv_obj_add_flag(sl, LV_OBJ_FLAG_PRESS_LOCK);
+            lv_obj_clear_flag(sl, LV_OBJ_FLAG_GESTURE_BUBBLE);
+            lv_obj_add_event_cb(sl, SettingsBrightnessCb, LV_EVENT_VALUE_CHANGED, this);
+        }
+        // Status (top row visibility) — top-filled stack icon + switch.
+        {
+            lv_obj_t* row = MakeRowShell(settings_root_);
+            MakeStackIcon(row, 0);
+            lv_obj_t* sw = lv_switch_create(row);
+            if (show_top) lv_obj_add_state(sw, LV_STATE_CHECKED);
+            lv_obj_add_event_cb(sw, SettingsTopToggleCb, LV_EVENT_VALUE_CHANGED, this);
+        }
+        // Bottom text visibility — bottom-filled stack icon + switch.
+        {
+            lv_obj_t* row = MakeRowShell(settings_root_);
+            MakeStackIcon(row, 2);
+            lv_obj_t* sw = lv_switch_create(row);
+            if (show_bottom) lv_obj_add_state(sw, LV_STATE_CHECKED);
+            lv_obj_add_event_cb(sw, SettingsBottomToggleCb, LV_EVENT_VALUE_CHANGED, this);
+        }
+        // WiFi — reactive wifi/wifi_off icon + switch.
+        {
+            lv_obj_t* row = MakeRowShell(settings_root_);
+            MakeFaIcon(row, wifi_on ? kIconWifiOn() : kIconWifiOff());
+            lv_obj_t* sw = lv_switch_create(row);
+            if (wifi_on) lv_obj_add_state(sw, LV_STATE_CHECKED);
+            lv_obj_add_event_cb(sw, SettingsWifiToggleCb, LV_EVENT_VALUE_CHANGED, this);
+        }
+        // Hotspot — switches OTA URL between home (LAN) and away (Tailscale)
+        // endpoints; reboots on toggle. Configure URLs once via MCP tools
+        // self.firmware.set_ota_home / set_ota_away.
+        // Icon: the wifi glyph rotated 180° = signal radiating downward,
+        // the canonical "personal hotspot / tethering" pictogram.
+        // Switch state is derived from the LIVE wifi/ota_url, not the stored
+        // hotspot_away flag, so an out-of-band change to ota_url (e.g. via
+        // self.firmware.set_ota_url) doesn't leave the UI lying.
+        {
+            lv_obj_t* row = MakeRowShell(settings_root_);
+            lv_obj_t* icon = MakeFaIcon(row, kIconWifiOn());
+            lv_obj_set_style_transform_pivot_x(icon, LV_PCT(50), 0);
+            lv_obj_set_style_transform_pivot_y(icon, LV_PCT(50), 0);
+            lv_obj_set_style_transform_rotation(icon, 1800, 0);  // 180.0°
+            std::string current = Settings("wifi", false).GetString("ota_url", "");
+            std::string away_url = s.GetString("ota_away", "");
+            bool initially_away = !away_url.empty() && current == away_url;
+            lv_obj_t* sw = lv_switch_create(row);
+            if (initially_away) lv_obj_add_state(sw, LV_STATE_CHECKED);
+            lv_obj_add_event_cb(sw, SettingsHotspotToggleCb, LV_EVENT_VALUE_CHANGED, this);
+        }
+        (void)rotation;
+
+        // Close button
+        lv_obj_t* close = lv_button_create(settings_root_);
+        lv_obj_set_style_margin_top(close, 8, 0);
+        lv_obj_t* cl = lv_label_create(close);
+        lv_label_set_text(cl, "Close");
+        lv_obj_set_style_text_color(cl, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_add_event_cb(close, SettingsCloseCb, LV_EVENT_CLICKED, this);
+    }
 };
 
 class CustomBacklight : public Backlight {
@@ -529,16 +970,27 @@ private:
     }
 
     void InitializeButtons() {
-        // Push-to-talk on the boot button, mirroring the screen-press gesture.
-        // Pressing during the Starting state still enters Wi-Fi config mode.
-        boot_button_.OnPressDown([this]() {
+        // BOOT button: PTT only.
+        //   Click  : abort an ongoing reply (no menu — that's on the power key)
+        //   Hold   : push-to-talk start (when Idle, Wi-Fi up, no menu open)
+        //   Release: push-to-talk stop
+        boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
             DeviceState s = app.GetDeviceState();
             if (s == kDeviceStateStarting) {
                 EnterWifiConfigMode();
                 return;
             }
-            if (s == kDeviceStateIdle || s == kDeviceStateSpeaking) {
+            if (s == kDeviceStateSpeaking) {
+                app.AbortSpeaking(kAbortReasonNone);
+            }
+        });
+        boot_button_.OnLongPress([this]() {
+            auto& app = Application::GetInstance();
+            auto& wifi = WifiManager::GetInstance();
+            if (!wifi.IsConnected() || wifi.IsConfigMode()) return;
+            if (app.GetDeviceState() == kDeviceStateIdle &&
+                display_ != nullptr && !display_->IsSettingsOpen()) {
                 app.ToggleChatState();
             }
         });
@@ -548,11 +1000,38 @@ private:
                 app.StopListening();
             }
         });
-        // OTA is intentionally NOT bound to the button anymore — long-press
-        // would race with push-to-talk. Trigger via the self.upgrade_firmware
-        // MCP tool when needed.
     }
 
+    // The bottom physical button is the AXP2101 PWRON key — it doesn't have
+    // its own GPIO. We poll the PMIC's IRQ status register every 50 ms and
+    // dispatch short-press → settings menu.
+    // PollPowerKey() does blocking I2C reads, so we cannot run it on the
+    // shared esp_timer worker — a stalled bus would delay every other
+    // periodic timer in the system (backlight, power-save, wifi). Use a
+    // dedicated FreeRTOS task that sleeps 50 ms between polls instead.
+    TaskHandle_t pmic_poll_task_ = nullptr;
+    void StartPmicKeyPolling() {
+        xTaskCreate(
+            [](void* arg) {
+                auto* self = static_cast<WaveshareEsp32s3TouchAMOLED1inch8*>(arg);
+                const TickType_t period = pdMS_TO_TICKS(50);
+                while (true) {
+                    if (self->pmic_) {
+                        int ev = self->pmic_->PollPowerKey();
+                        if (ev == 1 && self->display_ != nullptr) {
+                            // LVGL ops must run with the app/display lock; defer.
+                            Application::GetInstance().Schedule([self]() {
+                                if (self->display_) self->display_->ToggleSettings();
+                            });
+                        }
+                    }
+                    vTaskDelay(period);
+                }
+            },
+            "pmic_key_poll", 4096, this, 5, &pmic_poll_task_);
+    }
+
+    esp_lcd_panel_handle_t panel_handle_ = nullptr;
     void InitializeSH8601Display() {
         esp_lcd_panel_io_handle_t panel_io = nullptr;
         esp_lcd_panel_handle_t panel = nullptr;
@@ -583,6 +1062,7 @@ private:
         panel_config.bits_per_pixel = 16;
         panel_config.vendor_config = (void *)&vendor_config;
         ESP_ERROR_CHECK(esp_lcd_new_panel_sh8601(panel_io, &panel_config, &panel));
+        panel_handle_ = panel;
 
         esp_lcd_panel_reset(panel);
         esp_lcd_panel_init(panel);
@@ -595,6 +1075,7 @@ private:
         backlight_->RestoreBrightness();
     }
 
+    esp_lcd_touch_handle_t tp_handle_ = nullptr;
     void InitializeTouch()
     {
         esp_lcd_touch_handle_t tp;
@@ -628,6 +1109,7 @@ private:
         ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(codec_i2c_bus_, &tp_io_config, &tp_io_handle));
         ESP_LOGI(TAG, "Initialize touch controller");
         ESP_ERROR_CHECK(esp_lcd_touch_new_i2c_ft5x06(tp_io_handle, &tp_cfg, &tp));
+        tp_handle_ = tp;
         const lvgl_port_touch_cfg_t touch_cfg = {
             .disp = lv_display_get_default(), 
             .handle = tp,
@@ -665,6 +1147,49 @@ private:
                 Settings settings("ota", false);
                 return settings.GetString("url", "");
             });
+        // Hotspot-mode OTA URLs. The Settings menu's "Hotspot" toggle swaps
+        // wifi/ota_url between these two values and reboots. Set once and
+        // forget — survives reboots in the "ui" NVS namespace.
+        mcp_server.AddTool("self.firmware.set_ota_home",
+            "Set the OTA URL used when on home Wi-Fi (typically a LAN IP, "
+            "e.g. http://192.168.1.50:8003/xiaozhi/ota/).",
+            PropertyList({Property("url", kPropertyTypeString)}),
+            [](const PropertyList& p) -> ReturnValue {
+                Settings("ui", true).SetString("ota_home",
+                    p["url"].value<std::string>());
+                return true;
+            });
+        mcp_server.AddTool("self.firmware.set_ota_away",
+            "Set the OTA URL used when on a phone hotspot or away from home "
+            "(typically a Tailscale 100.x.y.z address, e.g. "
+            "http://100.64.0.5:8003/xiaozhi/ota/). Requires the phone to be "
+            "running Tailscale so the hotspot inherits the tailnet route.",
+            PropertyList({Property("url", kPropertyTypeString)}),
+            [](const PropertyList& p) -> ReturnValue {
+                Settings("ui", true).SetString("ota_away",
+                    p["url"].value<std::string>());
+                return true;
+            });
+        mcp_server.AddTool("self.firmware.get_ota_endpoints",
+            "Return both stored OTA URLs (home and away), the URL currently "
+            "in wifi/ota_url (the one OTA actually uses), and which mode it "
+            "matches (home / away / other if it has been set out-of-band).",
+            PropertyList(),
+            [](const PropertyList& p) -> ReturnValue {
+                Settings ui("ui", false);
+                std::string home = ui.GetString("ota_home", "");
+                std::string away = ui.GetString("ota_away", "");
+                std::string current = Settings("wifi", false).GetString("ota_url", "");
+                const char* active = "other";
+                if (!current.empty()) {
+                    if (current == away)      active = "away";
+                    else if (current == home) active = "home";
+                }
+                return std::string("{\"home\":\"") + home +
+                       "\",\"away\":\"" + away +
+                       "\",\"current\":\"" + current +
+                       "\",\"active\":\"" + active + "\"}";
+            });
     }
 
 public:
@@ -679,6 +1204,7 @@ public:
         InitializeTouch();
         InitializeButtons();
         InitializeTools();
+        StartPmicKeyPolling();
     }
 
     virtual AudioCodec* GetAudioCodec() override {
@@ -694,6 +1220,25 @@ public:
 
     virtual Backlight* GetBacklight() override {
         return backlight_;
+    }
+
+    // Apply rotation via the panel's MADCTL (hardware mirror) and matching
+    // touch driver flags. Only 0° and 180° are supported here — 90°/270°
+    // would need LVGL's framebuffer dimensions swapped to match the panel's
+    // post-swap pixel order, which esp_lvgl_port doesn't expose cleanly.
+    //   rot == 2 → 180°; anything else → 0°
+    void ApplyRotation(int rot) {
+        bool flipped = (rot == 2);
+        if (panel_handle_) {
+            esp_lcd_panel_swap_xy(panel_handle_, false);
+            esp_lcd_panel_mirror(panel_handle_, flipped, flipped);
+        }
+        if (tp_handle_) {
+            esp_lcd_touch_set_swap_xy(tp_handle_, false);
+            esp_lcd_touch_set_mirror_x(tp_handle_, flipped);
+            esp_lcd_touch_set_mirror_y(tp_handle_, flipped);
+        }
+        Settings("ui", true).SetInt("rotation", flipped ? 2 : 0);
     }
 
     virtual bool GetBatteryLevel(int &level, bool& charging, bool& discharging) override {
@@ -718,5 +1263,20 @@ public:
 };
 
 bool CustomLcdDisplay::cancel_pending_ = false;
+
+void CustomLcdDisplay::SettingsRotationCb(lv_event_t* e) {
+    auto* self = static_cast<CustomLcdDisplay*>(lv_event_get_user_data(e));
+    if (!self) return;
+    lv_obj_t* btn = lv_event_get_target_obj(e);
+    int rot = (int)(intptr_t)lv_obj_get_user_data(btn);
+    rot = (rot == 0) ? 2 : 0;  // toggle 0° ↔ 180°
+    lv_obj_set_user_data(btn, (void*)(intptr_t)rot);
+    auto* board = static_cast<WaveshareEsp32s3TouchAMOLED1inch8*>(&Board::GetInstance());
+    if (board) board->ApplyRotation(rot);
+    if (lv_obj_get_child_count(btn) > 0) {
+        lv_obj_t* lbl = lv_obj_get_child(btn, 0);
+        lv_label_set_text(lbl, rot == 0 ? "0°" : "180°");
+    }
+}
 
 DECLARE_BOARD(WaveshareEsp32s3TouchAMOLED1inch8);
