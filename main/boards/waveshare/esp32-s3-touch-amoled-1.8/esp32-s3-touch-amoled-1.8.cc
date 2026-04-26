@@ -1,6 +1,11 @@
 #include "wifi_board.h"
 #include "display/lcd_display.h"
+#include "display/lvgl_display/lvgl_theme.h"
+#include "display/lvgl_display/lvgl_font.h"
 #include "esp_lcd_sh8601.h"
+
+LV_FONT_DECLARE(icons_bs_ms_36);
+LV_FONT_DECLARE(clock_mono_30);
 
 #include "codecs/es8311_audio_codec.h"
 #include "application.h"
@@ -26,6 +31,7 @@
 #include <cstring>
 
 #define TAG "WaveshareEsp32s3TouchAMOLED1inch8"
+#define DEBUG_RULER 1
 
 class Pmic : public Axp2101 {
 public:
@@ -73,77 +79,104 @@ static const sh8601_lcd_init_cmd_t vendor_specific_init[] = {
 
 class CustomLcdDisplay : public SpiLcdDisplay {
 private:
-    static bool EmotionIs(const char* emotion, const char* name) {
-        return emotion != nullptr && std::strcmp(emotion, name) == 0;
+    lv_obj_t* clock_label_ = nullptr;
+    lv_obj_t* battery_widget_ = nullptr;
+    lv_obj_t* battery_body_ = nullptr;
+    lv_obj_t* battery_bar_ = nullptr;
+    lv_obj_t* battery_nub_ = nullptr;
+    DeviceState last_state_ = kDeviceStateUnknown;
+    bool awaiting_response_ = false;
+    int64_t awaiting_started_us_ = 0;
+    static constexpr int64_t kAwaitingTimeoutUs = 10LL * 1000 * 1000;  // 10 s
+
+    // Set by the cancel gestures (slide-off, abort) so the next Listening→Idle
+    // transition is treated as a discard rather than "awaiting response."
+    static bool cancel_pending_;
+
+    static bool LooksLikeClock(const char* s) {
+        return s != nullptr && std::strlen(s) == 5 && s[2] == ':';
     }
 
-    static lv_color_t GetEmotionColor(const char* emotion) {
-        if (EmotionIs(emotion, "happy") || EmotionIs(emotion, "laughing")) {
-            return lv_color_hex(0x20C997);
-        }
-        if (EmotionIs(emotion, "sad") || EmotionIs(emotion, "sleepy")) {
-            return lv_color_hex(0x5C7CFA);
-        }
-        if (EmotionIs(emotion, "angry")) {
-            return lv_color_hex(0xFF4D4F);
-        }
-        if (EmotionIs(emotion, "thinking")) {
-            return lv_color_hex(0x845EF7);
-        }
-        if (EmotionIs(emotion, "surprised")) {
-            return lv_color_hex(0xFAB005);
-        }
-        if (EmotionIs(emotion, "listening")) {
-            return lv_color_hex(0x12B886);
-        }
-        if (EmotionIs(emotion, "speaking")) {
-            return lv_color_hex(0xFD7E14);
-        }
-        return lv_color_hex(0x2F80ED);
+    static lv_color_t BatteryColor(int pct, bool charging) {
+        if (charging)       return lv_color_hex(0x4263EB); // blue
+        else if (pct > 50)  return lv_color_hex(0x37B24D); // green
+        else if (pct > 20)  return lv_color_hex(0xFAB005); // yellow
+        else                return lv_color_hex(0xE03131); // red
     }
 
+    static lv_color_t ColorForState(DeviceState s) {
+        switch (s) {
+            case kDeviceStateStarting:        return lv_color_hex(0x3F3F3F); // 0x1F3D7A
+            case kDeviceStateWifiConfiguring: return lv_color_hex(0x3F3F3F); // 0x4263EB
+            case kDeviceStateAudioTesting:    return lv_color_hex(0x3F3F3F); // 0x15AABF
+            case kDeviceStateActivating:      return lv_color_hex(0x3F3F3F); // 0xFD7E14
+            case kDeviceStateConnecting:
+            case kDeviceStateListening:       return lv_color_hex(0xE03131);
+            case kDeviceStateIdle:            return lv_color_hex(0x3F3F3F);
+            case kDeviceStateSpeaking:        return lv_color_hex(0x37B24D);
+            case kDeviceStateUpgrading:       return lv_color_hex(0x9333EA);
+            case kDeviceStateUnknown:
+            default:                          return lv_color_hex(0x000000);
+        }
+    }
+
+    // Push-to-talk: hold to listen, release to send. Short tap during
+    // Speaking interrupts the assistant. Sliding finger off the screen while
+    // holding cancels the recording without sending it to the server.
     static void OnScreenLongPressed(lv_event_t*) {
+        // Only Idle → start listening. Speaking is handled exclusively by
+        // OnScreenPressed (abort) — we never want a hold-during-speaking to
+        // turn into a new listening session.
         auto& app = Application::GetInstance();
         app.Schedule([]() {
             auto& app = Application::GetInstance();
-            if (app.GetDeviceState() != kDeviceStateStarting) {
+            if (app.GetDeviceState() == kDeviceStateIdle) {
                 app.ToggleChatState();
             }
         });
     }
 
-    static void AddLongPressHandler(lv_obj_t* obj) {
-        if (obj == nullptr) {
-            return;
-        }
-        lv_obj_add_flag(obj, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(obj, OnScreenLongPressed, LV_EVENT_LONG_PRESSED, nullptr);
+    static void OnScreenReleased(lv_event_t*) {
+        auto& app = Application::GetInstance();
+        app.Schedule([]() {
+            auto& app = Application::GetInstance();
+            if (app.GetDeviceState() == kDeviceStateListening) {
+                app.StopListening();
+            }
+        });
     }
 
-    void ApplySolidEmotionStyle(lv_color_t color) {
-        if (gif_controller_ != nullptr) {
-            gif_controller_->Stop();
-            gif_controller_.reset();
-        }
+    // PRESS_LOST fires when the finger slides off while still pressed —
+    // cancel the in-progress utterance without committing it.
+    static void OnScreenPressLost(lv_event_t*) {
+        auto& app = Application::GetInstance();
+        app.Schedule([]() {
+            auto& app = Application::GetInstance();
+            if (app.GetDeviceState() == kDeviceStateListening) {
+                cancel_pending_ = true;  // skip the awaiting-response green window
+                app.AbortSpeaking(kAbortReasonNone);
+                app.SetDeviceState(kDeviceStateIdle);
+            }
+        });
+    }
 
-        if (emoji_image_ != nullptr) {
-            lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+    // Touch-down during Speaking interrupts the assistant immediately.
+    static void OnScreenPressed(lv_event_t*) {
+        auto& app = Application::GetInstance();
+        if (app.GetDeviceState() == kDeviceStateSpeaking) {
+            app.Schedule([]() {
+                Application::GetInstance().AbortSpeaking(kAbortReasonNone);
+            });
         }
-        if (emoji_label_ != nullptr) {
-            lv_label_set_text(emoji_label_, "");
-            lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
-        }
-        if (emoji_box_ == nullptr) {
-            return;
-        }
+    }
 
-        lv_obj_remove_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_set_size(emoji_box_, (LV_HOR_RES * 3) / 5, (LV_HOR_RES * 3) / 5);
-        lv_obj_set_style_bg_color(emoji_box_, color, 0);
-        lv_obj_set_style_bg_opa(emoji_box_, LV_OPA_COVER, 0);
-        lv_obj_set_style_border_width(emoji_box_, 0, 0);
-        lv_obj_set_style_radius(emoji_box_, LV_RADIUS_CIRCLE, 0);
-        lv_obj_center(emoji_box_);
+    static void AddLongPressHandler(lv_obj_t* obj) {
+        if (obj == nullptr) return;
+        lv_obj_add_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(obj, OnScreenPressed,     LV_EVENT_PRESSED,      nullptr);
+        lv_obj_add_event_cb(obj, OnScreenLongPressed, LV_EVENT_LONG_PRESSED, nullptr);
+        lv_obj_add_event_cb(obj, OnScreenReleased,    LV_EVENT_RELEASED,     nullptr);
+        lv_obj_add_event_cb(obj, OnScreenPressLost,   LV_EVENT_PRESS_LOST,   nullptr);
     }
 
 public:
@@ -158,27 +191,243 @@ public:
                     bool swap_xy)
         : SpiLcdDisplay(io_handle, panel_handle,
                     width, height, offset_x, offset_y, mirror_x, mirror_y, swap_xy) {
-        // Note: UI customization should be done in SetupUI(), not in constructor
-        // to ensure lvgl objects are created before accessing them
+        auto bs_ms_font = std::make_shared<LvglBuiltInFont>(&icons_bs_ms_36);
+        auto& tm = LvglThemeManager::GetInstance();
+        for (const char* name : {"light", "dark"}) {
+            if (auto* t = tm.GetTheme(name)) {
+                static_cast<LvglTheme*>(t)->set_icon_font(bs_ms_font);
+            }
+        }
     }
 
     virtual void SetupUI() override {
         SpiLcdDisplay::SetupUI();
 
         DisplayLockGuard lock(this);
+        LvglTheme* lvgl_theme = static_cast<LvglTheme*>(current_theme_);
+        const lv_color_t white = lv_color_hex(0xFFFFFF);
+
+        lv_obj_set_style_pad_left(top_bar_, LV_HOR_RES * 0.1, 0);
+        lv_obj_set_style_pad_right(top_bar_, LV_HOR_RES * 0.1, 0);
+        lv_obj_set_style_bg_opa(top_bar_, LV_OPA_TRANSP, 0);
+
+        lv_obj_align(status_bar_, LV_ALIGN_BOTTOM_MID, 0, 0);
+        lv_obj_set_style_bg_opa(status_bar_, LV_OPA_TRANSP, 0);
         lv_obj_set_style_pad_left(status_bar_, LV_HOR_RES * 0.1, 0);
         lv_obj_set_style_pad_right(status_bar_, LV_HOR_RES * 0.1, 0);
+
+        if (bottom_bar_ != nullptr) {
+            lv_obj_align(bottom_bar_, LV_ALIGN_CENTER, 0, 0);
+            lv_obj_set_style_bg_opa(bottom_bar_, LV_OPA_TRANSP, 0);
+        }
+
+        if (emoji_box_ != nullptr) {
+            lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+        }
+
+        if (network_label_ != nullptr)      lv_obj_set_style_text_color(network_label_, white, 0);
+        if (mute_label_ != nullptr)         lv_obj_set_style_text_color(mute_label_, white, 0);
+        if (status_label_ != nullptr)       lv_obj_set_style_text_color(status_label_, white, 0);
+        if (notification_label_ != nullptr) lv_obj_set_style_text_color(notification_label_, white, 0);
+        if (chat_message_label_ != nullptr) lv_obj_set_style_text_color(chat_message_label_, white, 0);
+
+        // Clock is anchored directly to the screen at top-center so it stays
+        // dead-centered regardless of icon widths (top_bar_'s flex SPACE_BETWEEN
+        // would otherwise position it midway between neighbors, not on axis).
+        clock_label_ = lv_label_create(lv_screen_active());
+        lv_label_set_text(clock_label_, "--:--");
+        lv_obj_set_style_text_font(clock_label_, &clock_mono_30, 0);
+        lv_obj_set_style_text_color(clock_label_, white, 0);
+        lv_obj_set_style_text_align(clock_label_, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_align(clock_label_, LV_ALIGN_TOP_MID, 0, lvgl_theme->spacing(2));
+
+        if (battery_label_ != nullptr) {
+            lv_obj_t* right_icons = lv_obj_get_parent(battery_label_);
+            lv_obj_add_flag(battery_label_, LV_OBJ_FLAG_HIDDEN);
+            if (right_icons != nullptr) {
+                const int kBodyW = 40;
+                const int kBodyH = 18;
+                const int kNubW  = 3;
+                const int kNubH  = 8;
+
+                battery_widget_ = lv_obj_create(right_icons);
+                lv_obj_set_size(battery_widget_, kBodyW + kNubW, kBodyH);
+                lv_obj_set_style_bg_opa(battery_widget_, LV_OPA_TRANSP, 0);
+                lv_obj_set_style_border_width(battery_widget_, 0, 0);
+                lv_obj_set_style_pad_all(battery_widget_, 0, 0);
+                lv_obj_clear_flag(battery_widget_, LV_OBJ_FLAG_SCROLLABLE);
+
+                battery_body_ = lv_obj_create(battery_widget_);
+                lv_obj_set_size(battery_body_, kBodyW, kBodyH);
+                lv_obj_align(battery_body_, LV_ALIGN_LEFT_MID, 0, 0);
+                lv_obj_set_style_radius(battery_body_, 4, 0);
+                lv_obj_set_style_border_width(battery_body_, 2, 0);
+                lv_obj_set_style_border_color(battery_body_, white, 0);
+                lv_obj_set_style_bg_opa(battery_body_, LV_OPA_TRANSP, 0);
+                lv_obj_set_style_pad_all(battery_body_, 2, 0);
+                lv_obj_clear_flag(battery_body_, LV_OBJ_FLAG_SCROLLABLE);
+
+                battery_bar_ = lv_obj_create(battery_body_);
+                lv_obj_set_size(battery_bar_, 0, LV_PCT(100));
+                lv_obj_align(battery_bar_, LV_ALIGN_LEFT_MID, 0, 0);
+                lv_obj_set_style_radius(battery_bar_, 2, 0);
+                lv_obj_set_style_border_width(battery_bar_, 0, 0);
+                lv_obj_set_style_bg_color(battery_bar_, white, 0);
+                lv_obj_set_style_pad_all(battery_bar_, 0, 0);
+                lv_obj_clear_flag(battery_bar_, LV_OBJ_FLAG_SCROLLABLE);
+
+                battery_nub_ = lv_obj_create(battery_widget_);
+                lv_obj_set_size(battery_nub_, kNubW, kNubH);
+                lv_obj_align(battery_nub_, LV_ALIGN_RIGHT_MID, 0, 0);
+                lv_obj_set_style_radius(battery_nub_, 1, 0);
+                lv_obj_set_style_border_width(battery_nub_, 0, 0);
+                lv_obj_set_style_bg_color(battery_nub_, white, 0);
+                lv_obj_set_style_pad_all(battery_nub_, 0, 0);
+                lv_obj_clear_flag(battery_nub_, LV_OBJ_FLAG_SCROLLABLE);
+
+                lv_obj_move_to_index(battery_widget_, 0);
+            }
+        }
+
+        // Press-and-hold anywhere on screen toggles chat (replaces the boot
+        // button click as the primary "start/stop listening" gesture).
         AddLongPressHandler(container_);
-        AddLongPressHandler(emoji_box_);
         AddLongPressHandler(top_bar_);
         AddLongPressHandler(status_bar_);
         AddLongPressHandler(bottom_bar_);
-        ApplySolidEmotionStyle(GetEmotionColor("neutral"));
+
+        ApplyStateColor(Application::GetInstance().GetDeviceState());
+
+#ifdef DEBUG_RULER
+        DrawDebugRuler();
+#endif
     }
 
-    virtual void SetEmotion(const char* emotion) override {
+    void ApplyStateColor(DeviceState s) {
+        // Track Listening → Idle transition as "awaiting response" so the brief
+        // gap while the server runs STT/LLM/TTS doesn't show standby grey.
+        // Cancel gestures (slide-off, abort) set cancel_pending_ so the
+        // transition reads as a discard and skips the green window.
+        if (last_state_ == kDeviceStateListening && s == kDeviceStateIdle) {
+            if (cancel_pending_) {
+                cancel_pending_ = false;
+                awaiting_response_ = false;
+            } else {
+                awaiting_response_ = true;
+                awaiting_started_us_ = esp_timer_get_time();
+            }
+        } else if (s == kDeviceStateSpeaking || s == kDeviceStateListening) {
+            awaiting_response_ = false;
+            cancel_pending_ = false;
+        }
+        if (last_state_ == s) return;
+        last_state_ = s;
         DisplayLockGuard lock(this);
-        ApplySolidEmotionStyle(GetEmotionColor(emotion));
+        lv_color_t bg = ColorForState(s);
+        if (s == kDeviceStateIdle && awaiting_response_) {
+            // Use the Speaking green so the Listening → awaiting → Speaking
+            // run reads as a continuous color rather than a flash.
+            bg = ColorForState(kDeviceStateSpeaking);
+        }
+        lv_obj_t* screen = lv_screen_active();
+        lv_obj_set_style_bg_color(screen, bg, 0);
+        lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+        if (container_ != nullptr) {
+            lv_obj_set_style_bg_color(container_, bg, 0);
+            lv_obj_set_style_bg_opa(container_, LV_OPA_COVER, 0);
+        }
+    }
+
+    void DrawDebugRuler() {
+        lv_obj_t* screen = lv_screen_active();
+        const lv_color_t guide = lv_color_hex(0xFFFFFF);
+        auto thin_rect = [&](int x, int y, int w, int h) {
+            lv_obj_t* r = lv_obj_create(screen);
+            lv_obj_set_size(r, w, h);
+            lv_obj_set_pos(r, x, y);
+            lv_obj_set_style_bg_color(r, guide, 0);
+            lv_obj_set_style_bg_opa(r, LV_OPA_50, 0);
+            lv_obj_set_style_border_width(r, 0, 0);
+            lv_obj_set_style_pad_all(r, 0, 0);
+            lv_obj_set_style_radius(r, 0, 0);
+            lv_obj_clear_flag(r, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_remove_flag(r, LV_OBJ_FLAG_CLICKABLE);
+        };
+        const int cx = LV_HOR_RES / 2;
+        const int cy = LV_VER_RES / 2;
+        thin_rect(0, cy, LV_HOR_RES, 1);
+        thin_rect(cx, 0, 1, LV_VER_RES);
+        // Edge ticks placed symmetrically around the centerlines.
+        for (int dx = 50; dx <= cx; dx += 50) {
+            thin_rect(cx - dx, 0, 1, 8);
+            thin_rect(cx + dx, 0, 1, 8);
+            thin_rect(cx - dx, LV_VER_RES - 8, 1, 8);
+            thin_rect(cx + dx, LV_VER_RES - 8, 1, 8);
+        }
+        for (int dy = 50; dy <= cy; dy += 50) {
+            thin_rect(0, cy - dy, 8, 1);
+            thin_rect(0, cy + dy, 8, 1);
+            thin_rect(LV_HOR_RES - 8, cy - dy, 8, 1);
+            thin_rect(LV_HOR_RES - 8, cy + dy, 8, 1);
+        }
+    }
+
+    virtual void UpdateStatusBar(bool update_all) override {
+        SpiLcdDisplay::UpdateStatusBar(update_all);
+        ApplyStateColor(Application::GetInstance().GetDeviceState());
+
+        DisplayLockGuard lock(this);
+        if (clock_label_ != nullptr) {
+            time_t now = time(NULL);
+            struct tm* tm = localtime(&now);
+            if (tm->tm_year >= 2025 - 1900) {
+                char buf[8];
+                strftime(buf, sizeof(buf), "%H:%M", tm);
+                lv_label_set_text(clock_label_, buf);
+            } else {
+                lv_label_set_text(clock_label_, "--:--");
+            }
+        }
+        if (battery_bar_ != nullptr) {
+            int level;
+            bool charging, discharging;
+            if (Board::GetInstance().GetBatteryLevel(level, charging, discharging)) {
+                int pct = level < 0 ? 0 : (level > 100 ? 100 : level);
+                lv_obj_set_style_bg_color(battery_bar_, BatteryColor(pct, charging), 0);
+                lv_obj_set_width(battery_bar_, LV_PCT(pct));
+            }
+        }
+        // Drop the "thinking" indigo back to standby grey if no Speaking state
+        // arrives within the timeout (server unreachable, error, etc).
+        if (awaiting_response_ && last_state_ == kDeviceStateIdle &&
+            esp_timer_get_time() - awaiting_started_us_ > kAwaitingTimeoutUs) {
+            awaiting_response_ = false;
+            last_state_ = kDeviceStateUnknown;  // force ApplyStateColor to repaint
+            ApplyStateColor(kDeviceStateIdle);
+        }
+    }
+
+    virtual void SetTheme(Theme* theme) override {
+        SpiLcdDisplay::SetTheme(theme);
+        DisplayLockGuard lock(this);
+        const lv_color_t white = lv_color_hex(0xFFFFFF);
+        if (top_bar_ != nullptr)    lv_obj_set_style_bg_opa(top_bar_, LV_OPA_TRANSP, 0);
+        if (status_bar_ != nullptr) lv_obj_set_style_bg_opa(status_bar_, LV_OPA_TRANSP, 0);
+        if (bottom_bar_ != nullptr) lv_obj_set_style_bg_opa(bottom_bar_, LV_OPA_TRANSP, 0);
+        if (network_label_ != nullptr)      lv_obj_set_style_text_color(network_label_, white, 0);
+        if (status_label_ != nullptr)       lv_obj_set_style_text_color(status_label_, white, 0);
+        if (mute_label_ != nullptr)         lv_obj_set_style_text_color(mute_label_, white, 0);
+        if (notification_label_ != nullptr) lv_obj_set_style_text_color(notification_label_, white, 0);
+        if (chat_message_label_ != nullptr) lv_obj_set_style_text_color(chat_message_label_, white, 0);
+        if (clock_label_ != nullptr)        lv_obj_set_style_text_color(clock_label_, white, 0);
+        last_state_ = kDeviceStateUnknown;
+        ApplyStateColor(Application::GetInstance().GetDeviceState());
+    }
+
+    virtual void SetStatus(const char* status) override {
+        if (LooksLikeClock(status)) return;
+        ApplyStateColor(Application::GetInstance().GetDeviceState());
+        SpiLcdDisplay::SetStatus(status);
     }
 };
 
@@ -212,7 +461,8 @@ private:
     PowerSaveTimer* power_save_timer_;
 
     void InitializePowerSaveTimer() {
-        power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
+        // -1, -1, -1: no auto-sleep, no auto-shutdown. Keeps USB CDC alive.
+        power_save_timer_ = new PowerSaveTimer(-1, -1, -1);
         power_save_timer_->OnEnterSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(true);
             GetBacklight()->SetBrightness(20);
@@ -279,14 +529,28 @@ private:
     }
 
     void InitializeButtons() {
-        boot_button_.OnClick([this]() {
+        // Push-to-talk on the boot button, mirroring the screen-press gesture.
+        // Pressing during the Starting state still enters Wi-Fi config mode.
+        boot_button_.OnPressDown([this]() {
             auto& app = Application::GetInstance();
-            if (app.GetDeviceState() == kDeviceStateStarting) {
+            DeviceState s = app.GetDeviceState();
+            if (s == kDeviceStateStarting) {
                 EnterWifiConfigMode();
                 return;
             }
-            app.ToggleChatState();
+            if (s == kDeviceStateIdle || s == kDeviceStateSpeaking) {
+                app.ToggleChatState();
+            }
         });
+        boot_button_.OnPressUp([this]() {
+            auto& app = Application::GetInstance();
+            if (app.GetDeviceState() == kDeviceStateListening) {
+                app.StopListening();
+            }
+        });
+        // OTA is intentionally NOT bound to the button anymore — long-press
+        // would race with push-to-talk. Trigger via the self.upgrade_firmware
+        // MCP tool when needed.
     }
 
     void InitializeSH8601Display() {
@@ -382,6 +646,25 @@ private:
                 EnterWifiConfigMode();
                 return true;
             });
+        mcp_server.AddTool("self.firmware.set_ota_url",
+            "Set the URL the device pulls firmware from on long-press of the boot button. "
+            "Persisted in NVS so it survives reboots.",
+            PropertyList({
+                Property("url", kPropertyTypeString)
+            }),
+            [](const PropertyList& properties) -> ReturnValue {
+                std::string url = properties["url"].value<std::string>();
+                Settings settings("ota", true);
+                settings.SetString("url", url);
+                return true;
+            });
+        mcp_server.AddTool("self.firmware.get_ota_url",
+            "Return the URL currently configured for boot-button OTA.",
+            PropertyList(),
+            [](const PropertyList& properties) -> ReturnValue {
+                Settings settings("ota", false);
+                return settings.GetString("url", "");
+            });
     }
 
 public:
@@ -433,5 +716,7 @@ public:
         WifiBoard::SetPowerSaveLevel(level);
     }
 };
+
+bool CustomLcdDisplay::cancel_pending_ = false;
 
 DECLARE_BOARD(WaveshareEsp32s3TouchAMOLED1inch8);

@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>State colors · xiaozhi-client</title>
+<style>
+  body { font-family: system-ui, -apple-system, sans-serif; background: #fafafa; color: #111; padding: 24px; max-width: 760px; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  p  { color: #555; margin: 0 0 16px; font-size: 13px; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { padding: 12px 14px; text-align: left; border-bottom: 1px solid #eee; vertical-align: middle; font-size: 13px; }
+  th { background: #fafafa; font-weight: 500; color: #333; font-size: 12px; }
+  .sw { display: inline-block; width: 56px; height: 28px; border-radius: 4px; border: 1px solid rgba(0,0,0,.15); }
+  code { font-family: ui-monospace, monospace; font-size: 12px; color: #333; }
+  .you { background: #fff7e6; }
+  .pick { color: #888; font-style: italic; font-size: 11px; }
+</style>
+</head>
+<body>
+<h1>State background colors</h1>
+<p>The whole screen takes one of these colors based on the current device state. Rows highlighted in cream are the ones you specified; the rest are my picks — say the word on any.</p>
+<table>
+  <thead>
+    <tr>
+      <th>Swatch</th>
+      <th>State (`DeviceState`)</th>
+      <th>Hex</th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td><span class="sw" style="background:#000000"></span></td><td>Unknown</td><td><code>#000000</code></td><td class="pick">black — pre-init</td></tr>
+    <tr><td><span class="sw" style="background:#1F3D7A"></span></td><td>Starting</td><td><code>#1F3D7A</code></td><td class="pick">dark navy — booting</td></tr>
+    <tr><td><span class="sw" style="background:#4263EB"></span></td><td>WifiConfiguring</td><td><code>#4263EB</code></td><td class="pick">blue — captive portal / wifi setup</td></tr>
+    <tr><td><span class="sw" style="background:#15AABF"></span></td><td>AudioTesting</td><td><code>#15AABF</code></td><td class="pick">cyan — audio loopback test</td></tr>
+    <tr><td><span class="sw" style="background:#FD7E14"></span></td><td>Activating</td><td><code>#FD7E14</code></td><td class="pick">orange — talking to the activation server</td></tr>
+    <tr><td><span class="sw" style="background:#FAB005"></span></td><td>Connecting</td><td><code>#FAB005</code></td><td class="pick">amber — opening MQTT / WS</td></tr>
+    <tr class="you"><td><span class="sw" style="background:#3F3F3F"></span></td><td>Idle</td><td><code>#3F3F3F</code></td><td>(yours) dim dark grey</td></tr>
+    <tr class="you"><td><span class="sw" style="background:#E03131"></span></td><td>Listening</td><td><code>#E03131</code></td><td>(yours) red</td></tr>
+    <tr><td><span class="sw" style="background:#37B24D"></span></td><td>Speaking</td><td><code>#37B24D</code></td><td class="pick">green — assistant replying</td></tr>
+    <tr><td><span class="sw" style="background:#9333EA"></span></td><td>Upgrading</td><td><code>#9333EA</code></td><td class="pick">purple — OTA install</td></tr>
+  </tbody>
+</table>
+<h1 style="margin-top: 28px;">Battery bar colors</h1>
+<table>
+  <thead><tr><th>Swatch</th><th>When</th><th>Hex</th></tr></thead>
+  <tbody>
+    <tr><td><span class="sw" style="background:#4263EB"></span></td><td>Charging (USB plugged)</td><td><code>#4263EB</code></td></tr>
+    <tr><td><span class="sw" style="background:#37B24D"></span></td><td>Discharging, level &gt; 50%</td><td><code>#37B24D</code></td></tr>
+    <tr><td><span class="sw" style="background:#FAB005"></span></td><td>Discharging, level &gt; 20%</td><td><code>#FAB005</code></td></tr>
+    <tr><td><span class="sw" style="background:#E03131"></span></td><td>Discharging, level ≤ 20%</td><td><code>#E03131</code></td></tr>
+  </tbody>
+</table>
+</body>
+</html>

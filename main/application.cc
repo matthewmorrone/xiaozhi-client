@@ -219,9 +219,16 @@ void Application::Run() {
         }
 
         if (bits & MAIN_EVENT_SEND_AUDIO) {
-            while (auto packet = audio_service_.PopPacketFromSendQueue()) {
-                if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
-                    break;
+            // Don't drain the queue until the audio channel is up — otherwise
+            // PopPacketFromSendQueue moves the packet into a SendAudio that
+            // returns false (not connected), losing it. With this gate, we
+            // capture and queue speculatively while OpenAudioChannel runs in
+            // parallel, then flush once the WS is ready.
+            if (protocol_ && protocol_->IsAudioChannelOpened()) {
+                while (auto packet = audio_service_.PopPacketFromSendQueue()) {
+                    if (!protocol_->SendAudio(std::move(packet))) {
+                        break;
+                    }
                 }
             }
         }
@@ -536,7 +543,11 @@ void Application::InitializeProtocol() {
             } else if (strcmp(state->valuestring, "stop") == 0) {
                 Schedule([this]() {
                     if (GetDeviceState() == kDeviceStateSpeaking) {
-                        if (listening_mode_ == kListeningModeManualStop) {
+                        // If the user aborted, drop to Idle regardless of
+                        // listening_mode_. Otherwise the auto-resume modes
+                        // (AutoStop/Realtime) would jump straight back into
+                        // Listening, masking the cancel.
+                        if (aborted_ || listening_mode_ == kListeningModeManualStop) {
                             SetDeviceState(kDeviceStateIdle);
                         } else {
                             SetDeviceState(kDeviceStateListening);
@@ -699,15 +710,15 @@ void Application::HandleToggleChatEvent() {
 
     if (state == kDeviceStateIdle) {
         ListeningMode mode = GetDefaultListeningMode();
+        // Go to Listening immediately for instant UI/mic feedback. If the
+        // audio channel isn't up yet, OpenAudioChannel runs in parallel; the
+        // captured audio queues in audio_service_ until the channel opens.
+        SetListeningMode(mode);
         if (!protocol_->IsAudioChannelOpened()) {
-            SetDeviceState(kDeviceStateConnecting);
-            // Schedule to let the state change be processed first (UI update)
             Schedule([this, mode]() {
                 ContinueOpenAudioChannel(mode);
             });
-            return;
         }
-        SetListeningMode(mode);
     } else if (state == kDeviceStateSpeaking) {
         AbortSpeaking(kAbortReasonNone);
     } else if (state == kDeviceStateListening) {
@@ -716,18 +727,32 @@ void Application::HandleToggleChatEvent() {
 }
 
 void Application::ContinueOpenAudioChannel(ListeningMode mode) {
-    // Check state again in case it was changed during scheduling
-    if (GetDeviceState() != kDeviceStateConnecting) {
+    // User may have cancelled (state→Idle) or things otherwise moved on.
+    if (GetDeviceState() != kDeviceStateListening) {
         return;
     }
 
     if (!protocol_->IsAudioChannelOpened()) {
         if (!protocol_->OpenAudioChannel()) {
+            SetDeviceState(kDeviceStateIdle);
             return;
         }
     }
 
-    SetListeningMode(mode);
+    // Channel is up. Send the start-listening control message that was
+    // deferred when we entered Listening, and kick the audio drain loop so
+    // any queued packets flush.
+    if (GetDeviceState() == kDeviceStateListening) {
+        protocol_->SendStartListening(mode);
+        xEventGroupSetBits(event_group_, MAIN_EVENT_SEND_AUDIO);
+        // If user released the screen while the channel was opening, finish
+        // the gesture now that Start+audio have been emitted in order.
+        if (stop_after_open_) {
+            stop_after_open_ = false;
+            protocol_->SendStopListening();
+            SetDeviceState(kDeviceStateIdle);
+        }
+    }
 }
 
 void Application::HandleStartListeningEvent() {
@@ -748,15 +773,12 @@ void Application::HandleStartListeningEvent() {
     }
     
     if (state == kDeviceStateIdle) {
+        SetListeningMode(kListeningModeManualStop);
         if (!protocol_->IsAudioChannelOpened()) {
-            SetDeviceState(kDeviceStateConnecting);
-            // Schedule to let the state change be processed first (UI update)
             Schedule([this]() {
                 ContinueOpenAudioChannel(kListeningModeManualStop);
             });
-            return;
         }
-        SetListeningMode(kListeningModeManualStop);
     } else if (state == kDeviceStateSpeaking) {
         AbortSpeaking(kAbortReasonNone);
         SetListeningMode(kListeningModeManualStop);
@@ -765,16 +787,20 @@ void Application::HandleStartListeningEvent() {
 
 void Application::HandleStopListeningEvent() {
     auto state = GetDeviceState();
-    
+
     if (state == kDeviceStateAudioTesting) {
         audio_service_.EnableAudioTesting(false);
         SetDeviceState(kDeviceStateWifiConfiguring);
         return;
     } else if (state == kDeviceStateListening) {
-        if (protocol_) {
+        if (protocol_ && protocol_->IsAudioChannelOpened()) {
             protocol_->SendStopListening();
+            SetDeviceState(kDeviceStateIdle);
+        } else {
+            // Channel still opening — keep state at Listening and let
+            // ContinueOpenAudioChannel send Start+audio+Stop in order.
+            stop_after_open_ = true;
         }
-        SetDeviceState(kDeviceStateIdle);
     }
 }
 
@@ -791,17 +817,11 @@ void Application::HandleWakeWordDetectedEvent() {
         audio_service_.EncodeWakeWord();
         auto wake_word = audio_service_.GetLastWakeWord();
 
-        if (!protocol_->IsAudioChannelOpened()) {
-            SetDeviceState(kDeviceStateConnecting);
-            // Schedule to let the state change be processed first (UI update),
-            // then continue with OpenAudioChannel which may block for ~1 second
-            Schedule([this, wake_word]() {
-                ContinueWakeWordInvoke(wake_word);
-            });
-            return;
-        }
-        // Channel already opened, continue directly
-        ContinueWakeWordInvoke(wake_word);
+        // Go to Listening immediately; channel opens in parallel.
+        SetListeningMode(GetDefaultListeningMode());
+        Schedule([this, wake_word]() {
+            ContinueWakeWordInvoke(wake_word);
+        });
     } else if (state == kDeviceStateSpeaking || state == kDeviceStateListening) {
         AbortSpeaking(kAbortReasonWakeWordDetected);
         // Clear send queue to avoid sending residues to server
@@ -825,33 +845,37 @@ void Application::HandleWakeWordDetectedEvent() {
 }
 
 void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
-    // Check state again in case it was changed during scheduling
-    if (GetDeviceState() != kDeviceStateConnecting) {
+    // User may have cancelled while we were opening the channel.
+    if (GetDeviceState() != kDeviceStateListening) {
         return;
     }
 
     if (!protocol_->IsAudioChannelOpened()) {
         if (!protocol_->OpenAudioChannel()) {
             audio_service_.EnableWakeWordDetection(true);
+            SetDeviceState(kDeviceStateIdle);
             return;
         }
     }
 
     ESP_LOGI(TAG, "Wake word detected: %s", wake_word.c_str());
 #if CONFIG_SEND_WAKE_WORD_DATA
-    // Encode and send the wake word data to the server
     while (auto packet = audio_service_.PopWakeWordPacket()) {
         protocol_->SendAudio(std::move(packet));
     }
-    // Set the chat state to wake word detected
     protocol_->SendWakeWordDetected(wake_word);
-    SetListeningMode(GetDefaultListeningMode());
 #else
-    // Set flag to play popup sound after state changes to listening
-    // (PlaySound here would be cleared by ResetDecoder in EnableVoiceProcessing)
     play_popup_on_listening_ = true;
-    SetListeningMode(GetDefaultListeningMode());
 #endif
+    // We're already in Listening; send the deferred StartListening and drain
+    // any audio that queued while the channel was opening.
+    protocol_->SendStartListening(listening_mode_);
+    xEventGroupSetBits(event_group_, MAIN_EVENT_SEND_AUDIO);
+    if (stop_after_open_) {
+        stop_after_open_ = false;
+        protocol_->SendStopListening();
+        SetDeviceState(kDeviceStateIdle);
+    }
 }
 
 void Application::HandleStateChangedEvent() {
@@ -889,8 +913,13 @@ void Application::HandleStateChangedEvent() {
                     audio_service_.WaitForPlaybackQueueEmpty();
                 }
                 
-                // Send the start listening command
-                protocol_->SendStartListening(listening_mode_);
+                // Send the start listening command. If the audio channel
+                // isn't up yet (we entered Listening speculatively to start
+                // recording immediately), ContinueOpenAudioChannel /
+                // ContinueWakeWordInvoke will send it once the channel lands.
+                if (protocol_->IsAudioChannelOpened()) {
+                    protocol_->SendStartListening(listening_mode_);
+                }
                 audio_service_.EnableVoiceProcessing(true);
             }
 
@@ -946,6 +975,7 @@ void Application::AbortSpeaking(AbortReason reason) {
 
 void Application::SetListeningMode(ListeningMode mode) {
     listening_mode_ = mode;
+    stop_after_open_ = false;
     SetDeviceState(kDeviceStateListening);
 }
 

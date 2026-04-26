@@ -140,6 +140,10 @@ private:
     bool aborted_ = false;
     bool assets_version_checked_ = false;
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
+    // If user releases push-to-talk before OpenAudioChannel lands, queue the
+    // stop here so ContinueOpenAudioChannel can flush Start+audio+Stop in
+    // order once the WS is up.
+    bool stop_after_open_ = false;
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
 

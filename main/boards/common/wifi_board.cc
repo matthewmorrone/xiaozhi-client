@@ -61,24 +61,12 @@ void WifiBoard::StartNetwork() {
     // Set unified event callback - forward to NetworkEvent with SSID data
     wifi_manager.SetEventCallback([this](WifiEvent event, const std::string& data) {
         switch (event) {
-            case WifiEvent::Scanning:
-                OnNetworkEvent(NetworkEvent::Scanning);
-                break;
-            case WifiEvent::Connecting:
-                OnNetworkEvent(NetworkEvent::Connecting, data);
-                break;
-            case WifiEvent::Connected:
-                OnNetworkEvent(NetworkEvent::Connected, data);
-                break;
-            case WifiEvent::Disconnected:
-                OnNetworkEvent(NetworkEvent::Disconnected);
-                break;
-            case WifiEvent::ConfigModeEnter:
-                OnNetworkEvent(NetworkEvent::WifiConfigModeEnter);
-                break;
-            case WifiEvent::ConfigModeExit:
-                OnNetworkEvent(NetworkEvent::WifiConfigModeExit);
-                break;
+            case WifiEvent::Scanning:           OnNetworkEvent(NetworkEvent::Scanning); break;
+            case WifiEvent::Connecting:         OnNetworkEvent(NetworkEvent::Connecting, data); break;
+            case WifiEvent::Connected:          OnNetworkEvent(NetworkEvent::Connected, data); break;
+            case WifiEvent::Disconnected:       OnNetworkEvent(NetworkEvent::Disconnected); break;
+            case WifiEvent::ConfigModeEnter:    OnNetworkEvent(NetworkEvent::WifiConfigModeEnter); break;
+            case WifiEvent::ConfigModeExit:     OnNetworkEvent(NetworkEvent::WifiConfigModeExit); break;
         }
     });
 
@@ -250,7 +238,9 @@ const char* WifiBoard::GetNetworkStateIcon() {
     auto& wifi = WifiManager::GetInstance();
 
     if (wifi.IsConfigMode()) {
-        return FONT_AWESOME_WIFI;
+        // AP mode for provisioning — the device is not connected to a network
+        // as a station, so don't show the full-signal "connected" icon.
+        return FONT_AWESOME_WIFI_SLASH;
     }
     if (!wifi.IsConnected()) {
         return FONT_AWESOME_WIFI_SLASH;
